@@ -57,6 +57,7 @@ import { useWindowAI } from "hooks/useWindowAI";
 import { useFileSystem } from "contexts/fileSystem";
 import { readPdfText } from "components/apps/PDF/functions";
 import { useSnapshots } from "hooks/useSnapshots";
+import { useProcesses } from "contexts/process";
 
 type AIChatProps = {
   toggleAI: () => void;
@@ -170,6 +171,7 @@ const AIChat: FC<AIChatProps> = ({ toggleAI }) => {
   const [containerElement, setContainerElement] =
     useState<HTMLElement | null>();
   const { removeFromStack, setWallpaper } = useSession();
+  const processes = useProcesses();
   const { zIndex, ...focusableProps } = useFocusable(
     AI_WINDOW_ID,
     undefined,
@@ -184,7 +186,7 @@ const AIChat: FC<AIChatProps> = ({ toggleAI }) => {
     textArea.style.height = "auto";
     textArea.style.height = `${textArea.scrollHeight}px`;
   }, []);
-  const { exists, readFile, stat } = useFileSystem();
+  const { exists, readFile, stat, readdir, writeFile, rename, deletePath, createPath } = useFileSystem();
   const canvasRefs = useRef<Record<number, HTMLCanvasElement>>({});
   const sendMessage = useCallback(async () => {
     const { text } = conversation[conversation.length - 1];
@@ -247,6 +249,8 @@ const AIChat: FC<AIChatProps> = ({ toggleAI }) => {
     stat,
   ]);
   const { createSnapshot } = useSnapshots();
+  const TOOL_PREFIX = "TOOL_RESULT";
+
   const saveCanvasImage = useCallback(
     async (
       index: number,
@@ -269,6 +273,128 @@ const AIChat: FC<AIChatProps> = ({ toggleAI }) => {
     },
     [createSnapshot]
   );
+
+  const parseToolCall = (raw: string): { tool: string; args: any } | null => {
+    // Find a fenced JSON code block and parse it
+    const fence = /```json\s*([\s\S]*?)\s*```/i;
+    const m = fence.exec(raw);
+    const candidate = m ? m[1] : raw.trim();
+    try {
+      const obj = JSON.parse(candidate);
+      if (obj && typeof obj.tool === "string" && typeof obj.args === "object") {
+        return obj as { tool: string; args: any };
+      }
+    } catch {
+      // not a tool call
+    }
+    return null;
+  };
+
+  const clampPath = (path: string): string => path.replace(/\\/g, "/");
+
+  const invokeTool = useCallback(async (name: string, args: any) => {
+    try {
+      switch (name) {
+        case "list_dir": {
+          const path = clampPath(args.path || "");
+          if (!path) throw new Error("path required");
+          if (!(await exists(path))) throw new Error("path not found");
+          const list = await readdir(path);
+          return { ok: true, entries: list };
+        }
+        case "read_file": {
+          const path = clampPath(args.path || "");
+          const max = Math.min(Number(args.max_bytes) || 65536, 1 << 20);
+          const buf = await readFile(path);
+          const text = buf.toString().slice(0, max);
+          return { ok: true, text };
+        }
+        case "write_file": {
+          const path = clampPath(args.path || "");
+          const content = String(args.content ?? "");
+          const overwrite = Boolean(args.overwrite);
+          const wrote = await writeFile(path, Buffer.from(content), overwrite);
+          return { ok: wrote };
+        }
+        case "create_path": {
+          const directory = clampPath(args.directory || "");
+          const name = String(args.name || "");
+          const isDir = Boolean(args.isDir);
+          const overwrite = Boolean(args.overwrite);
+          const content = args.content ? Buffer.from(String(args.content)) : undefined;
+          const createdName = await createPath(name, directory, isDir ? undefined : content, 0, overwrite);
+          return { ok: Boolean(createdName), name: createdName };
+        }
+        case "delete_path": {
+          const path = clampPath(args.path || "");
+          const ok = await deletePath(path);
+          return { ok };
+        }
+        case "rename_path": {
+          const from = clampPath(args.from || "");
+          const to = clampPath(args.to || "");
+          const ok = await rename(from, to);
+          return { ok };
+        }
+        case "open_app": {
+          const id = String(args.id || "");
+          const toolArgs = (args.args || {}) as Record<string, unknown>;
+          const icon = args.icon as string | undefined;
+          processes.open(id, toolArgs, icon);
+          return { ok: true };
+        }
+        case "close_app": {
+          const id = String(args.id || "");
+          processes.close(id);
+          return { ok: true };
+        }
+        case "minimize_app": {
+          const id = String(args.id || "");
+          processes.minimize(id);
+          return { ok: true };
+        }
+        case "maximize_app": {
+          const id = String(args.id || "");
+          processes.maximize(id);
+          return { ok: true };
+        }
+        case "set_wallpaper": {
+          const image = String(args.image || "");
+          const fit = args.fit as any;
+          setWallpaper(image, fit);
+          return { ok: true };
+        }
+        case "system_info": {
+          const { displayVersion } = await import("utils/functions");
+          return {
+            ok: true,
+            viewport: { w: viewWidth(), h: window.innerHeight },
+            version: displayVersion(),
+          };
+        }
+        default:
+          return { ok: false, error: `Unknown tool: ${name}` };
+      }
+    } catch (error) {
+      return { ok: false, error: (error as Error)?.message || String(error) };
+    }
+  }, [exists, readFile, readdir, writeFile, rename, deletePath, createPath, processes, setWallpaper]);
+
+  const maybeHandleToolFromAI = useCallback(async (aiText: string) => {
+    const toolCall = parseToolCall(aiText);
+    if (!toolCall) return false;
+    const result = await invokeTool(toolCall.tool, toolCall.args);
+    // Feed result back to the model as a new user turn
+    const payload = `${TOOL_PREFIX} ${toolCall.tool}: ${JSON.stringify(result)}`;
+    sessionIdRef.current ||= Date.now();
+    aiWorker.current?.postMessage({
+      hasWindowAI: hasWindowAI,
+      id: sessionIdRef.current,
+      style: convoStyle,
+      text: payload,
+    });
+    return true;
+  }, [TOOL_PREFIX, convoStyle, hasWindowAI, aiWorker, invokeTool]);
 
   useEffect(() => {
     textAreaRef.current?.focus(PREVENT_SCROLL);
@@ -347,7 +473,12 @@ const AIChat: FC<AIChatProps> = ({ toggleAI }) => {
           data as AIResponse;
 
         if (complete) setResponding(false);
-        else addMessage(response, "ai", formattedResponse, streamId);
+        else {
+          // If the assistant just emitted a tool call, handle it and avoid duplicating UI text
+          maybeHandleToolFromAI(response).then((handled) => {
+            if (!handled) addMessage(response, "ai", formattedResponse, streamId);
+          });
+        }
       } else if ((data as AIResponse).response === "") {
         setFailedSession(true);
       }
@@ -356,7 +487,7 @@ const AIChat: FC<AIChatProps> = ({ toggleAI }) => {
     workerRef?.addEventListener("message", workerResponse);
 
     return () => workerRef?.removeEventListener("message", workerResponse);
-  }, [addMessage, aiWorker]);
+  }, [addMessage, aiWorker, maybeHandleToolFromAI]);
 
   return (
     <StyledAIChat

@@ -47,7 +47,32 @@ const WEB_LLM_MODEL_CONFIG = {
   top_p: 0.9,
 };
 const SYSTEM_PROMPT: ChatCompletionMessageParam = {
-  content: "You are a helpful AI assistant.",
+  content:
+    [
+      "You are a helpful AI assistant embedded inside a browser-based desktop (daedalOS).",
+      "When you need to perform actions on the desktop (read/write files, open/close apps, set wallpaper, etc.), emit exactly ONE JSON object inside a fenced code block, no prose before or after.",
+      "Use this format strictly:",
+      "```json",
+      '{"tool":"<name>","args":{...}}',
+      "```",
+      "Available tools and their schemas:",
+      "- read_file: { path: string, max_bytes?: number }",
+      "- list_dir: { path: string }",
+      "- write_file: { path: string, content: string, overwrite?: boolean }",
+      "- create_path: { directory: string, name: string, isDir?: boolean, content?: string, overwrite?: boolean }",
+      "- delete_path: { path: string }",
+      "- rename_path: { from: string, to: string }",
+      "- open_app: { id: string, args?: object, icon?: string }",
+      "- close_app: { id: string }",
+      "- minimize_app: { id: string }",
+      "- maximize_app: { id: string }",
+      "- set_wallpaper: { image: string, fit?: string }",
+      "- system_info: {}",
+      "Rules:",
+      "- Output ONLY the JSON block when calling a tool. No natural language around it.",
+      "- Wait for a TOOL_RESULT message before continuing the conversation.",
+      "- Keep outputs concise; prefer reading small files with max_bytes.",
+    ].join("\n"),
   role: "system",
 };
 
@@ -211,6 +236,11 @@ globalThis.addEventListener(
                   role: "user",
                   streamId: data.streamId,
                 });
+
+                // Ensure system prompt is included for WebLLM path
+                if (!prompts.some((p) => p.role === "system")) {
+                  prompts.unshift(SYSTEM_PROMPT as ChatCompletionMessageParam);
+                }
 
                 const stream = Boolean(data.streamId);
                 // eslint-disable-next-line no-await-in-loop
